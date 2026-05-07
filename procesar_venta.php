@@ -1,0 +1,370 @@
+<?php
+// procesar_venta.php - VERSIÓN BLINDADA (Corregido error fatal de fetch object/array)
+// Se desactiva el reporte de errores en pantalla para no romper el JSON con Warnings
+error_reporting(E_ALL); 
+ini_set('display_errors', 1);
+
+session_start();
+require_once '../includes/db.php';
+require_once '../includes/interfaz_helper.php';
+header('Content-Type: application/json');
+
+try {
+    // 1. VERIFICACIÓN DE SESIÓN
+    if (!isset($_SESSION['usuario_id'])) { 
+        throw new Exception('La sesión ha expirado. Inicia sesión nuevamente.'); 
+    }
+
+    // 2. RECEPCIÓN DE DATOS
+    $items = $_POST['items'] ?? [];
+    // SEGURIDAD: Forzamos tipos de datos para evitar inyecciones
+$id_cliente = (isset($_POST['id_cliente']) && $_POST['id_cliente'] !== '') ? intval($_POST['id_cliente']) : null;
+$metodo_pago = preg_replace('/[^a-zA-Z0-9_]/', '', $_POST['metodo_pago'] ?? 'efectivo');
+$total = floatval($_POST['total'] ?? 0);
+    $user_id = $_SESSION['usuario_id'];
+
+    // Datos extra blindados
+    $cupon_codigo = isset($_POST['cupon_codigo']) ? preg_replace('/[^a-zA-Z0-9]/', '', $_POST['cupon_codigo']) : null;
+    $desc_cupon_monto = floatval($_POST['desc_cupon_monto'] ?? 0);
+    $desc_manual_monto = floatval($_POST['desc_manual_monto'] ?? 0);
+    $saldo_favor_usado = floatval($_POST['saldo_favor_usado'] ?? 0);
+    $pago_deuda = floatval($_POST['pago_deuda'] ?? 0);
+
+    if(empty($items)) { 
+        throw new Exception('El carrito está vacío.'); 
+    }
+
+    $conexion->beginTransaction();
+
+    // ---------------------------------------------------------
+    // 3. VERIFICAR CAJA ABIERTA
+    // ---------------------------------------------------------
+    $stmtCaja = $conexion->prepare("SELECT id FROM cajas_sesion WHERE id_usuario = ? AND estado = 'abierta'");
+    $stmtCaja->execute([$user_id]);
+    $caja = $stmtCaja->fetch(PDO::FETCH_ASSOC);
+    
+    if(!$caja) { 
+        throw new Exception("No tienes una caja abierta. Por favor realiza la apertura de caja."); 
+    }
+    $id_caja_sesion = $caja['id'];
+    $conf = $conexion->query("SELECT dinero_por_punto, redondeo_auto, tipo_negocio FROM configuracion WHERE id=1")->fetch(PDO::FETCH_ASSOC);
+    $redondeo_activo = (isset($conf['redondeo_auto']) && $conf['redondeo_auto'] == 1 && strtolower($metodo_pago) === 'efectivo');
+    $rubro_actual = $conf['tipo_negocio'] ?? 'kiosco';
+
+    // ---------------------------------------------------------
+    // 4. VALIDACIÓN DE STOCK (PREVIA A LA VENTA)
+    // ---------------------------------------------------------
+    foreach($items as $item) {
+        // Consultamos datos seguros con FETCH_ASSOC
+        $stmtProd = $conexion->prepare("SELECT descripcion, stock_actual, tipo, codigo_barras FROM productos WHERE id = ?");
+        $stmtProd->execute([$item['id']]);
+        $prodDB = $stmtProd->fetch(PDO::FETCH_ASSOC);
+
+        if (!$prodDB) throw new Exception("El producto ID {$item['id']} ya no existe en el sistema.");
+
+        $cantidad_venta = $item['cantidad'];
+
+        // LÓGICA DE COMBOS
+        if ($prodDB['tipo'] === 'combo') {
+            // --- NUEVA VALIDACIÓN DE VIGENCIA ---
+            $hoy = date('Y-m-d');
+            // Buscamos la regla del combo usando el código de barras
+            $stmtVigencia = $conexion->prepare("SELECT fecha_inicio, fecha_fin, es_ilimitado, nombre FROM combos WHERE codigo_barras = ? LIMIT 1");
+            $stmtVigencia->execute([$prodDB['codigo_barras']]);
+            $reglaCombo = $stmtVigencia->fetch(PDO::FETCH_ASSOC);
+
+            if ($reglaCombo) {
+                if ($reglaCombo['es_ilimitado'] == 0) {
+                    if ($hoy < $reglaCombo['fecha_inicio'] || $hoy > $reglaCombo['fecha_fin']) {
+                        throw new Exception("La oferta '{$reglaCombo['nombre']}' ya no está vigente o venció.");
+                    }
+                }
+            }
+            // ------------------------------------
+            $id_combo_real = null;
+            
+            // A. Buscar por código de barras
+            if (!empty($prodDB['codigo_barras'])) { 
+                 $stmtLink = $conexion->prepare("SELECT id FROM combos WHERE codigo_barras = ? LIMIT 1");
+                 $stmtLink->execute([$prodDB['codigo_barras']]); 
+                 $resLink = $stmtLink->fetch(PDO::FETCH_ASSOC);
+                 if($resLink) $id_combo_real = $resLink['id'];
+            }
+
+            // B. Buscar por nombre exacto (Fallback)
+            if (!$id_combo_real) {
+                $stmtLink = $conexion->prepare("SELECT id FROM combos WHERE nombre = ? LIMIT 1");
+                $stmtLink->execute([$prodDB['descripcion']]);
+                $resLink = $stmtLink->fetch(PDO::FETCH_ASSOC);
+                if($resLink) $id_combo_real = $resLink['id'];
+            }
+
+            // Validar Stock Hijos
+            if ($id_combo_real) {
+                $stmtHijos = $conexion->prepare("
+                    SELECT p.descripcion, p.stock_actual, ci.cantidad as cant_necesaria 
+                    FROM combo_items ci 
+                    JOIN productos p ON ci.id_producto = p.id 
+                    WHERE ci.id_combo = ?
+                ");
+                $stmtHijos->execute([$id_combo_real]);
+                $hijos = $stmtHijos->fetchAll(PDO::FETCH_ASSOC);
+
+                if (!empty($hijos)) {
+                    foreach ($hijos as $hijo) {
+                        $total_necesario = $hijo['cant_necesaria'] * $cantidad_venta;
+                        // Forzamos floatval para evitar errores de comparación numérica
+                        if (floatval($hijo['stock_actual']) < $total_necesario) {
+                            throw new Exception("Falta mercadería para el combo: '{$hijo['descripcion']}'. (Stock: ".floatval($hijo['stock_actual']).", Necesitas: $total_necesario)");
+                        }
+                    }
+                } else {
+                    // Combo vacío: Validar stock padre
+                    if (floatval($prodDB['stock_actual']) < $cantidad_venta) {
+                        throw new Exception("Stock insuficiente para el combo '{$prodDB['descripcion']}'.");
+                    }
+                }
+            } else {
+                 // No se encontró enlace: Validar stock padre
+                 if (floatval($prodDB['stock_actual']) < $cantidad_venta) {
+                    throw new Exception("Stock insuficiente para '{$prodDB['descripcion']}' (Link Combo no encontrado).");
+                }
+            }
+        } 
+        // LÓGICA PRODUCTO SIMPLE
+        elseif ($prodDB['tipo'] !== 'pesable') { 
+            if (floatval($prodDB['stock_actual']) < $cantidad_venta) {
+                throw new Exception("Stock insuficiente para '{$prodDB['descripcion']}'. (Stock: ".floatval($prodDB['stock_actual']).")");
+            }
+        }
+    }
+
+        // --- NUEVA VALIDACIÓN: CONTROL DE LÍMITE DE CUPÓN ---
+    if (!empty($cupon_codigo)) {
+        $stmtCheckCup = $conexion->prepare("SELECT cantidad_limite, usos_actuales, activo FROM cupones WHERE codigo = ?");
+        $stmtCheckCup->execute([$cupon_codigo]);
+        $cupData = $stmtCheckCup->fetch(PDO::FETCH_ASSOC);
+
+        if ($cupData) {
+            if ($cupData['activo'] == 0) {
+                throw new Exception("El cupón '$cupon_codigo' ya no está activo.");
+            }
+            // Si el límite es mayor a 0 (0 significa infinito)
+            if ($cupData['cantidad_limite'] > 0) {
+                if ($cupData['usos_actuales'] >= $cupData['cantidad_limite']) {
+                    throw new Exception("El cupón '$cupon_codigo' ha alcanzado su límite de usos permitido.");
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 5. REGISTRO DE LA VENTA (CABECERA)
+    // ---------------------------------------------------------
+
+    $total = redondearVenta($total, $redondeo_activo);
+    $fecha_actual = date('Y-m-d H:i:s');
+    
+    // Recepción del estado y vinculación de la IA
+    $estado_venta = $_POST['estado_venta'] ?? 'completada';
+    $id_transferencia = $_POST['id_transferencia'] ?? null;
+
+    $sql = "INSERT INTO ventas (id_caja_sesion, id_usuario, id_cliente, total, metodo_pago, fecha, estado, descuento_monto_cupon, descuento_manual, codigo_cupon, tipo_negocio) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    $stmt = $conexion->prepare($sql);
+    $stmt->execute([$id_caja_sesion, $user_id, $id_cliente, $total, $metodo_pago, $fecha_actual, $estado_venta, $desc_cupon_monto, $desc_manual_monto, $cupon_codigo, $rubro_actual]);
+    
+    $venta_id = $conexion->lastInsertId();
+
+    // Vincular la transferencia con la venta y marcarla como pendiente o completada
+    if (!empty($id_transferencia)) {
+        $stmtTr = $conexion->prepare("SELECT datos_json FROM transferencias WHERE id = ?");
+        $stmtTr->execute([$id_transferencia]);
+        $trData = $stmtTr->fetch(PDO::FETCH_ASSOC);
+        if ($trData) {
+            $jsonTr = json_decode($trData['datos_json'], true);
+            $jsonTr['estado'] = ($estado_venta === 'pendiente_transferencia') ? 'pendiente' : 'completada';
+            $jsonTr['id_venta'] = $venta_id;
+            // Guardamos el total y la caja para que aparezca en el listado y se pueda aprobar luego
+            $jsonTr['total_venta'] = $total;
+            $jsonTr['id_caja'] = $id_caja_sesion;
+            $conexion->prepare("UPDATE transferencias SET datos_json = ? WHERE id = ?")->execute([json_encode($jsonTr, JSON_UNESCAPED_UNICODE), $id_transferencia]);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 6. DETALLES Y DESCUENTO DE STOCK REAL
+    // ---------------------------------------------------------
+    $sqlDetalle = "INSERT INTO detalle_ventas (id_venta, id_producto, cantidad, precio_historico, subtotal, tipo_negocio) VALUES (?, ?, ?, ?, ?, ?)";
+    $stmtDetalle = $conexion->prepare($sqlDetalle);
+
+    foreach($items as $item) {
+        $subtotal = $item['precio'] * $item['cantidad'];
+        $stmtDetalle->execute([$venta_id, $item['id'], floatval($item['cantidad']), $item['precio'], $subtotal, $rubro_actual]);
+
+        // Verificamos tipo nuevamente para estar seguros
+        $stmtTipo = $conexion->prepare("SELECT tipo, codigo_barras, descripcion FROM productos WHERE id = ?");
+        $stmtTipo->execute([$item['id']]);
+        $dProd = $stmtTipo->fetch(PDO::FETCH_ASSOC); // AQUÍ ESTABA EL ERROR: Faltaba FETCH_ASSOC
+        
+        if ($dProd && $dProd['tipo'] === 'combo') {
+            $id_combo_real = null;
+            
+            // Buscar ID Combo (Misma lógica segura)
+            if(!empty($dProd['codigo_barras'])) {
+                $stmtLink = $conexion->prepare("SELECT id FROM combos WHERE codigo_barras = ? LIMIT 1");
+                $stmtLink->execute([$dProd['codigo_barras']]);
+                $res = $stmtLink->fetch(PDO::FETCH_ASSOC); // AQUÍ ESTABA EL ERROR: Faltaba FETCH_ASSOC
+                if($res) $id_combo_real = $res['id'];
+            }
+            if(!$id_combo_real) {
+                $stmtLink = $conexion->prepare("SELECT id FROM combos WHERE nombre = ? LIMIT 1");
+                $stmtLink->execute([$dProd['descripcion']]);
+                $res = $stmtLink->fetch(PDO::FETCH_ASSOC); // AQUÍ ESTABA EL ERROR: Faltaba FETCH_ASSOC
+                if($res) $id_combo_real = $res['id'];
+            }
+
+            // Descontar
+            $descontado_ingredientes = false;
+            if ($id_combo_real) {
+                $stmtHijos = $conexion->prepare("SELECT id_producto, cantidad FROM combo_items WHERE id_combo = ?");
+                $stmtHijos->execute([$id_combo_real]);
+                $hijos = $stmtHijos->fetchAll(PDO::FETCH_ASSOC);
+                
+                if (!empty($hijos)) {
+                    foreach ($hijos as $hijo) {
+                        $descuento_real = $hijo['cantidad'] * $item['cantidad'];
+                        $conexion->prepare("UPDATE productos SET stock_actual = stock_actual - ? WHERE id = ?")->execute([$descuento_real, $hijo['id_producto']]);
+                    }
+                    $descontado_ingredientes = true;
+                }
+            }
+            
+            // Si es un combo, JAMÁS tocamos el stock del producto padre (id).
+            // Solo descontamos los hijos arriba. Si no tiene hijos, no descuenta nada (porque es una oferta, no un producto físico).
+            if (!$descontado_ingredientes) {
+                // No hacemos nada. El combo es virtual.
+            }
+
+        } else {
+            // Producto Normal
+            $conexion->prepare("UPDATE productos SET stock_actual = stock_actual - ? WHERE id = ?")->execute([floatval($item['cantidad']), $item['id']]);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 7. PAGOS MIXTOS / CTA CTE / PUNTOS (Igual que antes)
+    // ---------------------------------------------------------
+    if($metodo_pago === 'Mixto' && !empty($pagos_mixtos)) {
+        $stmtMix = $conexion->prepare("INSERT INTO pagos_ventas (id_venta, metodo_pago, monto, tipo_negocio) VALUES (?, ?, ?, ?)");
+        if (is_string($pagos_mixtos)) $pagos_mixtos = json_decode($pagos_mixtos, true);
+        foreach($pagos_mixtos as $metodo_nombre => $monto) {
+            if($monto > 0) $stmtMix->execute([$venta_id, $metodo_nombre, $monto, $rubro_actual]);
+        }
+    }
+
+    if ($id_cliente > 1) { 
+        if ($metodo_pago === 'CtaCorriente') {
+            $monto_a_deber = $total - $saldo_favor_usado; 
+            if($monto_a_deber > 0) {
+                 $conexion->prepare("INSERT INTO movimientos_cc (id_cliente, id_venta, id_usuario, tipo, monto, descripcion, fecha, tipo_negocio) VALUES (?, ?, ?, 'debe', ?, 'Compra Fiado Ticket #$venta_id', ?, ?)")->execute([$id_cliente, $venta_id, $user_id, $monto_a_deber, $fecha_actual, $rubro_actual]);
+            }
+        }
+        
+        $conf = $conexion->query("SELECT dinero_por_punto FROM configuracion WHERE id=1")->fetch(PDO::FETCH_ASSOC);
+        $ratio = floatval($conf['dinero_por_punto'] ?? 100);
+        if ($ratio > 0.1) {
+            $puntos_nuevos = floor($total / $ratio);
+            if ($puntos_nuevos > 0) {
+                $conexion->prepare("UPDATE clientes SET puntos_acumulados = puntos_acumulados + ? WHERE id = ?")->execute([$puntos_nuevos, $id_cliente]);
+            }
+        }
+        
+        if ($saldo_favor_usado > 0) {
+            $conexion->prepare("UPDATE clientes SET saldo_favor = saldo_favor - ? WHERE id = ?")->execute([$saldo_favor_usado, $id_cliente]);
+            $conexion->prepare("INSERT INTO movimientos_cc (id_cliente, id_venta, id_usuario, tipo, monto, descripcion, fecha, tipo_negocio) VALUES (?, ?, ?, 'haber', ?, 'Uso Saldo a Favor', ?, ?)")->execute([$id_cliente, $venta_id, $user_id, $saldo_favor_usado * -1, $fecha_actual, $rubro_actual]);
+        }
+
+                if ($pago_deuda > 0) {
+            $concepto = "Pago a cuenta en Ticket #" . $venta_id;
+            $conexion->prepare("INSERT INTO movimientos_cc (id_cliente, id_venta, id_usuario, tipo, monto, descripcion, fecha) VALUES (?, ?, ?, 'haber', ?, ?, ?)")->execute([$id_cliente, $venta_id, $user_id, $pago_deuda, $concepto, $fecha_actual]);
+        }
+    }
+
+    // --- NUEVA LÓGICA: ACTUALIZAR USO DE CUPÓN ---
+    if (!empty($cupon_codigo)) {
+        $stmtCup = $conexion->prepare("UPDATE cupones SET usos_actuales = usos_actuales + 1 WHERE codigo = ?");
+        $stmtCup->execute([$cupon_codigo]);
+    }
+
+    
+    // Auditoría
+    $detalles_audit = "Venta #$venta_id | Total: $$total | Cliente ID: $id_cliente";
+    if($desc_manual_monto > 0) $detalles_audit .= " | Desc.Manual: $$desc_manual_monto";
+    $conexion->prepare("INSERT INTO auditoria (fecha, id_usuario, accion, detalles, tipo_negocio) VALUES (?, ?, 'VENTA_REALIZADA', ?, ?)")->execute([$fecha_actual, $user_id, $detalles_audit, $rubro_actual]);
+
+    // --- INICIO CONEXIÓN AFIP ---
+    $conf_gral = $conexion->query("SELECT ticket_modo FROM configuracion WHERE id=1")->fetch(PDO::FETCH_ASSOC);
+    if ($conf_gral['ticket_modo'] === 'afip' && $total > 0) {
+        $afip_db = $conexion->query("SELECT * FROM afip_config WHERE id=1")->fetch(PDO::FETCH_ASSOC);
+        if ($afip_db && !empty($afip_db['cuit'])) {
+            require_once '../Afip.php';
+            
+            try {
+                // Truco para crear las columnas si no existen sin que tengas que tocar la base de datos
+                $conexion->query("ALTER TABLE ventas ADD COLUMN cae VARCHAR(100) NULL, ADD COLUMN cae_vencimiento DATE NULL, ADD COLUMN nro_factura INT NULL");
+            } catch (Exception $e) { /* Si ya existen las columnas, lo ignora y sigue */ }
+
+            $afip = new Afip(array(
+                'CUIT' => (string)$afip_db['cuit'],
+                'production' => ($afip_db['modo'] === 'produccion'),
+                'cert' => __DIR__ . '/../afip/certificado.crt',
+                'key' => __DIR__ . '/../afip/privada.key',
+                'res_folder' => __DIR__ . '/../afip/'
+            ));
+
+            $doc_tipo = 99; // Consumidor Final
+            $doc_nro = 0;
+            if ($id_cliente > 1) {
+                $cli = $conexion->prepare("SELECT dni_cuit FROM clientes WHERE id = ?");
+                $cli->execute([$id_cliente]);
+                $datos_cli = $cli->fetch(PDO::FETCH_ASSOC);
+                if ($datos_cli && strlen($datos_cli['dni_cuit']) == 8) { $doc_tipo = 96; $doc_nro = (string)$datos_cli['dni_cuit']; } 
+                elseif ($datos_cli && strlen($datos_cli['dni_cuit']) == 11) { $doc_tipo = 80; $doc_nro = (string)$datos_cli['dni_cuit']; }
+            }
+
+            try {
+                $last_voucher = $afip->ElectronicBilling->GetLastVoucher($afip_db['punto_venta'], 11);
+                $nro_factura = $last_voucher + 1;
+                $data = array(
+                    'CantReg' 	=> 1, 'PtoVta' 	=> $afip_db['punto_venta'], 'CbteTipo' 	=> 11, 'Concepto' 	=> 1,
+                    'DocTipo' 	=> $doc_tipo, 'DocNro' 	=> $doc_nro, 'CbteDesde' => $nro_factura, 'CbteHasta' => $nro_factura,
+                    'CbteFch' 	=> intval(date('Ymd')), 'ImpTotal' 	=> round($total, 2), 'ImpTotConc'=> 0, 'ImpNeto' 	=> round($total, 2),
+                    'ImpOpEx' 	=> 0, 'ImpIVA' 	=> 0, 'ImpTrib' 	=> 0, 'MonId' 	=> 'PES', 'MonCotiz' 	=> 1
+                );
+                $res = $afip->ElectronicBilling->CreateVoucher($data);
+                
+                $conexion->prepare("UPDATE ventas SET cae = ?, cae_vencimiento = ?, nro_factura = ? WHERE id = ?")
+                         ->execute([$res['CAE'], $res['CAEFchVto'], $nro_factura, $venta_id]);
+            } catch (Exception $e) {
+                $conexion->rollBack();
+                // Logueamos el error real para que sepas qué pasó
+                error_log("Error AFIP Venta #$venta_id: " . $e->getMessage());
+                echo json_encode(['status' => 'error', 'msg' => 'Error de comunicación: ' . $e->getMessage()]);
+                exit;
+            }
+        }
+    }
+    // --- FIN CONEXIÓN AFIP ---
+
+    $conexion->commit();
+    echo json_encode(['status' => 'success', 'id_venta' => $venta_id, 'msg' => 'Venta procesada correctamente']);
+
+} catch (Exception $e) {
+    if ($conexion->inTransaction()) {
+        $conexion->rollBack();
+    }
+    // Devolvemos el error en JSON para que el frontend lo muestre en alerta roja
+    echo json_encode(['status' => 'error', 'msg' => $e->getMessage()]);
+}
+?>
